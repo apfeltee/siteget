@@ -1,12 +1,15 @@
 #!/usr/bin/ruby
 
 require "uri"
+require "json"
+require "yaml"
 require "digest"
 require "fileutils"
-require "base64"
+require "net/https"
 require "nokogiri"
-require "httpclient"
 require "trollop"
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.80 Safari/537.36"
 
 class SiteGet
   @@selectors =
@@ -16,42 +19,71 @@ class SiteGet
     # images
     {sel: "img", rep: "src", ext: nil},
     {sel: "img[data-thumb]", rep: "data-thumb", ext: nil, post: nil},
+    {sel: "img[data-src]", rep: "data-src", ext: nil, post: nil},
     {sel: "input[src][type=image]", rep: "src", ext: nil, post: nil},
     # css
     {sel: "link[rel=stylesheet][href]", rep: "href", ext: "css", post: nil}, # CSSPostProcessor
     # favicons
-    {sel: "link[rel=icon][href]", rep: "href", ext: nil, post: nil},
+    {sel: "link[rel*=icon][href]", rep: "href", ext: nil, post: nil},
+    {sel: "link[rel*=shortcut][href]", rep: "href", ext: nil, post: nil},
   ]
 
   def initialize(url, opts)
+    $stdout.sync = false
     @opts = opts
     @site = geturl(url)
     @parsed = URI.parse(url)
-    parse
+    @flog = {"info" => {}, "urls" => []}
   end
 
   def mlog(str)
-    $stderr << "-- " << str << "\n"
+    $stdout << "-- " << str << "\n"
+  end
+
+  def writelog
+    File.open(File.join(@opts[:resdir], "url-log.json"), "wb") do |fh|
+      fh << JSON.pretty_generate(@flog)
+    end
   end
 
   def geturl(url, **kwargs)
     mlog "downloading #{url.inspect} ..."
-    http = HTTPClient.new
-    return http.get(url, :follow_redirect => true, **kwargs)
+    uri = URI.parse(url)
+    http = Net::HTTP.new(uri.host, uri.port)
+    if url.start_with?("https") then
+      http.use_ssl = true
+    end
+    http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+    request = Net::HTTP::Get.new(uri.request_uri, {'User-Agent' => USER_AGENT})
+    response = http.request(request)
+    return response
   end
 
-  def guess_ext(base, selector)
-    # select (or, rather, guess) extension from the basename of the url
-    # this function unfortunately results in a redundant filename, i.e.,
-    # "foobar.jpg" gets bastardized into "foobar-jpg.jpg" due to shitty regex
-    if selector[:ext] == nil then
-      if (ext = File.extname(base)) != nil && (ext.length > 0) then
-        # discard leading dot, i.e., ".jpg" => "jpg"
-        return ext[1 .. -1]
-      end
-      return "unknown"
+  def mkname(url, selector)
+    # get url components (for query string)
+    purl = URI.parse(url)
+    extension = File.extname(purl.path)
+    basename = File.basename(purl.path, extension)
+    # make a "clean" name...
+    # well, not really clean, but better than using a sha256 hash
+    cleanname = (basename + (purl.query ? purl.query : "")).gsub(/[^0-9A-Za-z]/, "-").gsub(/^-/, "")
+    # if filename exceeds a certain length, turn it into a hash sum instead
+    # (rather than trying to figure out how to create a unique filename, even by shrinking ...)
+    # appends the first 10 characters from the original cleanname, to ease identification
+    if cleanname.length > 500 then
+      mlog "filename is too long, using hashsum instead"
+      md5 = Digest::MD5.new
+      md5.update cleanname
+      cleanname = cleanname[0 .. 10] + md5.hexdigest 
     end
-    return selector[:ext]
+    # create a physical location for the file to be written to
+    if (selector[:ext] == nil) && (extension.length == 0) then
+      extension = "unknown"
+    end
+    if extension.length > 0 then
+      extension = extension[1 .. -1]
+    end
+    return cleanname + "." + extension
   end
 
   def mkurl(oldurl, selector)
@@ -74,16 +106,9 @@ class SiteGet
         url << File.dirname(@parsed.path) << "/" << oldurl
       end
     end
-    # get url components (for query string)
-    purl = URI.parse(url)
-    #basename = File.basename(purl.path)
-    basename = purl.path
-    # make a "clean" name...
-    # well, not really clean, but better than using a sha256 hash
-    cleanname = (basename + (purl.query ? purl.query : "")).gsub(/[^0-9A-Za-z]/, "-").gsub(/^-/, "")
-    # create a physical location for the file to be written to
-    fulldest = File.join(@opts[:resdir], cleanname + "." + guess_ext(basename, selector))
+    fulldest = File.join(@opts[:resdir], mkname(url, selector))
     # coincidentally, the local url is the same as the file dest. whudathunkit
+    @flog["urls"] << {"url" => url, "local" => fulldest}
     if File.file?(fulldest) then
       return fulldest
     end
@@ -99,11 +124,12 @@ class SiteGet
   end
 
   def parse
+    @flog["info"]["mainpage"] = @parsed.to_s
     body = @site.body
     main = Nokogiri::HTML(body)
     @@selectors.each do |selector|
       # iterate over each selector
-      mlog "++ processing selector #{selector.inspect} ..."
+      mlog "++ processing selector #{selector[:sel].inspect} ..."
       if (nodes = main.css(selector[:sel])) then
         nodes.each do |node|
           url = node[selector[:rep]]
@@ -130,7 +156,10 @@ end
 
 argv = ARGV
 if argv.length > 0 then
-  p argv
-  p opts
-  SiteGet.new(argv.shift, opts)
+  sg = SiteGet.new(argv.shift, opts)
+  begin
+    sg.parse
+  ensure
+    sg.writelog
+  end
 end
